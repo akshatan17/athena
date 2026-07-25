@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 import re
+import time
+import traceback
 
 import numpy as np
 import streamlit as st
@@ -33,6 +35,7 @@ CHUNK_CHARS = 1800
 CHUNK_OVERLAP = 400
 TOP_K = 6
 EMBED_BATCH = 16
+MAX_RETRIES = 5
 HISTORY_TURNS = 4      # prior exchanges fed back into the prompt
 
 SYSTEM_PROMPT = """You are a careful research assistant answering questions about \
@@ -146,28 +149,55 @@ def build_chunks(docs: dict[str, list[tuple[int, str]]]) -> list[dict]:
 
 # --- Embeddings and retrieval ----------------------------------------------
 
-def embed(client: genai.Client, texts: list[str], task_type: str) -> np.ndarray:
-    """Embed texts and L2-normalise, so cosine similarity is a plain dot product."""
-    vectors: list[list[float]] = []
+TRANSIENT = ("429", "resource_exhausted", "rate limit", "quota",
+             "503", "unavailable", "500", "internal", "deadline")
 
-    for start in range(0, len(texts), EMBED_BATCH):
-        batch = texts[start:start + EMBED_BATCH]
-        config = types.EmbedContentConfig(
-            task_type=task_type,
-            output_dimensionality=EMBED_DIM,
-        )
+
+def _embed_request(client: genai.Client, contents, task_type: str) -> list[list[float]]:
+    """One embed call, retrying transient failures with exponential backoff."""
+    config = types.EmbedContentConfig(
+        task_type=task_type,
+        output_dimensionality=EMBED_DIM,
+    )
+    last_error: Exception | None = None
+
+    for attempt in range(MAX_RETRIES):
         try:
             response = client.models.embed_content(
-                model=EMBED_MODEL, contents=batch, config=config
+                model=EMBED_MODEL, contents=contents, config=config
             )
-            vectors.extend(e.values for e in response.embeddings)
+            return [e.values for e in response.embeddings]
+        except Exception as exc:
+            last_error = exc
+            if not any(flag in str(exc).lower() for flag in TRANSIENT):
+                raise
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(min(2 ** attempt, 30))
+
+    raise last_error  # type: ignore[misc]
+
+
+def embed(client: genai.Client, texts: list[str], task_type: str,
+          progress=None) -> np.ndarray:
+    """Embed texts and L2-normalise, so cosine similarity is a plain dot product."""
+    vectors: list[list[float]] = []
+    batch_size = EMBED_BATCH
+    index = 0
+
+    while index < len(texts):
+        group = texts[index:index + batch_size]
+        try:
+            vectors.extend(_embed_request(client, group, task_type))
         except Exception:
-            # Some endpoints accept only one input per request. Fall back.
-            for item in batch:
-                response = client.models.embed_content(
-                    model=EMBED_MODEL, contents=item, config=config
-                )
-                vectors.extend(e.values for e in response.embeddings)
+            if batch_size > 1:
+                # This endpoint rejects multi-input requests. Drop to one per
+                # call permanently rather than retrying the batch every time.
+                batch_size = 1
+                continue
+            raise
+        index += len(group)
+        if progress:
+            progress(min(index / len(texts), 1.0))
 
     matrix = np.asarray(vectors, dtype=np.float32)
     # Truncated MRL embeddings are not unit-length, so normalise explicitly.
@@ -290,11 +320,17 @@ if signature != st.session_state.doc_signature:
         chunks = build_chunks(docs)
 
         st.write(f"Embedding {len(chunks)} chunks…")
+        bar = st.progress(0.0)
         try:
-            matrix = embed(client, [c["text"] for c in chunks], "RETRIEVAL_DOCUMENT")
+            matrix = embed(
+                client, [c["text"] for c in chunks], "RETRIEVAL_DOCUMENT",
+                progress=bar.progress,
+            )
         except Exception as exc:
             status.update(label="Embedding failed", state="error")
-            st.error(f"Could not embed the documents: {exc}")
+            st.error(f"Could not embed the documents:\n\n{type(exc).__name__}: {exc}")
+            with st.expander("Full traceback"):
+                st.code(traceback.format_exc())
             st.stop()
 
         st.session_state.chunks = chunks
