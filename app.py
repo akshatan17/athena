@@ -300,7 +300,7 @@ signature = tuple(sorted((f.name, f.size) for f in uploads))
 
 if signature != st.session_state.doc_signature:
     with st.status("Indexing your PDFs…", expanded=True) as status:
-        st.write("Extracting text…")
+        st.markdown("Extracting text…")
         docs, sources = {}, {}
         for uploaded in uploads:
             pages = read_pdf(uploaded)
@@ -316,10 +316,10 @@ if signature != st.session_state.doc_signature:
             )
             st.stop()
 
-        st.write("Splitting into chunks…")
+        st.markdown("Splitting into chunks…")
         chunks = build_chunks(docs)
 
-        st.write(f"Embedding {len(chunks)} chunks…")
+        st.markdown(f"Embedding {len(chunks)} chunks…")
         bar = st.progress(0.0)
         try:
             matrix = embed(
@@ -394,7 +394,16 @@ if question:
                     temperature=0.2,
                 ),
             )
-            answer = st.write_stream(chunk.text or "" for chunk in stream)
+            # Streamed manually into a placeholder rather than via
+            # st.write_stream, which lazily imports pandas to type-check what
+            # it renders. This app never shows a DataFrame, so that import is
+            # pure cost -- and it hard-fails on Windows machines where an
+            # Application Control policy blocks pandas' unsigned .pyd files.
+            placeholder = st.empty()
+            answer = ""
+            for chunk in stream:
+                answer += chunk.text or ""
+                placeholder.markdown(answer)
 
             with st.expander("Sources used"):
                 st.text(context)
